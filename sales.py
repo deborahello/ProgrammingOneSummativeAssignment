@@ -1,89 +1,112 @@
-import pandas as pd
-import uuid
 from datetime import datetime
-from rich.console import Console
+from decimal import Decimal
 
-console = Console()
+import pandas as pd
+
+from product import Product
+
 
 class Sales:
-    def __init__(self, inventory, finance):
-        # USES-A relationship setup
+    """Builds a sale and records only successfully completed sales."""
+
+    COLUMNS = [
+        "sale_id",
+        "product_id",
+        "product_name",
+        "quantity",
+        "unit_price",
+        "subtotal",
+        "sale_date",
+    ]
+
+    def __init__(self, inventory, sales_df=None):
         self.inventory = inventory
-        self.finance = finance
-        self.sales_history = []
+        self.current_sale = []
+        self.sales_df = sales_df if sales_df is not None else pd.DataFrame(columns=self.COLUMNS)
+        self._sale_counter = self._find_last_sale_id()
 
-    def new_sale(self):
-        current_sale = []
-        
-        while True:
-            productid = input("Enter Product ID (or 'done' to finish): ")
-            if productid.lower() == 'done':
-                break
-                
-            # Ask Inventory if product exists
-            product = self.inventory.find_product(productid)
-            if not product:
-                console.print("[red]Product not found. Please try again.[/red]")
-                continue
-                
-            try:
-                quantity = int(input("Enter quantity: "))
-                if quantity <= 0:
-                    console.print("[red]Quantity must be greater than 0.[/red]")
-                    continue
-            except ValueError:
-                console.print("[red]Invalid input. Please enter a number.[/red]")
-                continue
+    def add_item(self, product_id, quantity):
+        quantity = Product.validate_quantity(quantity)
+        if quantity <= 0:
+            raise ValueError("Quantity must be greater than zero.")
 
-            # Ask Inventory if stock is sufficient
-            if not self.inventory.check_stock(productid, quantity):
-                console.print("[red]Insufficient stock available.[/red]")
-                continue
-                
-            # Add valid item to cart
-            current_sale.append({
-                "productid": productid,
-                "name": product.name,
-                "quantity": quantity,
-                "unit_price": product.price,
-                "line_total": product.price * quantity
-            })
-            console.print("[green]Item added to cart![/green]")
+        product = self.inventory.find_product(product_id)
+        if product is None:
+            raise ValueError("Product not found.")
 
-        if not current_sale:
-            return
+        existing_item = next(
+            (item for item in self.current_sale if item["product_id"] == product.product_id),
+            None,
+        )
+        current_quantity = existing_item["quantity"] if existing_item else 0
+        if not self.inventory.check_stock(product.product_id, current_quantity + quantity):
+            raise ValueError("Insufficient stock available.")
 
-        self._process_checkout(current_sale)
+        if existing_item:
+            existing_item["quantity"] += quantity
+            existing_item["subtotal"] = existing_item["unit_price"] * existing_item["quantity"]
+            return existing_item
 
-    def _process_checkout(self, current_sale):
-        # Ask Finance to handle money logic
-        total_due = self.finance.calculate_total(current_sale)
-        payment_success = self.finance.process_payment(total_due)
-        
-        if payment_success:
-            sale_id = str(uuid.uuid4())[:8]
-            sale_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Record completed sale
-            for item in current_sale:
-                record = {
-                    "Sale ID": sale_id,
-                    "Date": sale_date,
-                    **item
+        item = {
+            "product_id": product.product_id,
+            "product_name": product.product_name,
+            "quantity": quantity,
+            "unit_price": product.price,
+            "subtotal": product.price * quantity,
+        }
+        self.current_sale.append(item)
+        return item
+
+    def calculate_total(self):
+        return sum((item["subtotal"] for item in self.current_sale), Decimal("0"))
+
+    def complete_sale(self):
+        if not self.current_sale:
+            raise ValueError("There are no items in the current sale.")
+
+        for item in self.current_sale:
+            if not self.inventory.check_stock(item["product_id"], item["quantity"]):
+                raise ValueError(f"Insufficient stock for {item['product_name']}.")
+
+        self._sale_counter += 1
+        sale_date = datetime.now().strftime("%d/%m/%Y %H:%M")
+        rows = []
+
+        for item in self.current_sale:
+            self.inventory.reduce_stock(item["product_id"], item["quantity"])
+            rows.append(
+                {
+                    "sale_id": self._sale_counter,
+                    "product_id": item["product_id"],
+                    "product_name": item["product_name"],
+                    "quantity": item["quantity"],
+                    "unit_price": str(item["unit_price"]),
+                    "subtotal": str(item["subtotal"]),
+                    "sale_date": sale_date,
                 }
-                self.sales_history.append(record)
-                # Tell Inventory to reduce stock ONLY after success
-                self.inventory.reduce_stock(item["productid"], item["quantity"])
-                
-            console.print(f"[green]Sale {sale_id} completed successfully![/green]")
-        else:
-            console.print("[red]Payment failed. Sale cancelled. Stock not reduced.[/red]")
+            )
 
-    def display_history(self):
-        if not self.sales_history:
-            console.print("No sales history found.")
-            return
-            
-        # Use Pandas for the reporting layer
-        df = pd.DataFrame(self.sales_history)
-        print(df.to_string(index=False))
+        summary = {
+            "sale_id": self._sale_counter,
+            "items": [dict(item) for item in self.current_sale],
+            "total": self.calculate_total(),
+            "sale_date": sale_date,
+        }
+        self.sales_df = pd.concat([self.sales_df, pd.DataFrame(rows)], ignore_index=True)
+        self.cancel_sale()
+        return summary
+
+    def cancel_sale(self):
+        self.current_sale.clear()
+
+    def get_sales_history(self):
+        return self.sales_df.copy()
+
+    def _find_last_sale_id(self):
+        if self.sales_df.empty:
+            return 0
+        try:
+            return max(int(value) for value in self.sales_df["sale_id"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Sales data contains an invalid sale ID.") from error
+
